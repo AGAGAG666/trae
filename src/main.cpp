@@ -5,8 +5,10 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <dlfcn.h>
-#include <string.h>
-#include <android/log.h>
+
+#include "pl/Hook.h"
+#include "pl/Gloss.h"
+#include "pl/internal/AndroidUtils.h"
 
 #include "ImGui/imgui.h"
 #include "ImGui/backends/imgui_impl_opengl3.h"
@@ -19,6 +21,7 @@
 JNIEnv* env = nullptr;
 
 static bool g_Initialized = false;
+static bool g_reloaded = false;
 static int g_Width = 0, g_Height = 0;
 static EGLContext g_TargetContext = EGL_NO_CONTEXT;
 static EGLSurface g_TargetSurface = EGL_NO_SURFACE;
@@ -50,7 +53,21 @@ static Config g_Config = {
 // Original function pointers
 // ==============================
 static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
-static void* (*orig_AAssetManager_open)(void*, const char*, int) = nullptr;
+
+static void (*orig_Input1)(void*, void*, void*) = nullptr;
+static void hook_Input1(void* thiz, void* a1, void* a2) {
+    if (orig_Input1) orig_Input1(thiz, a1, a2);
+    if (thiz && g_Initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+}
+
+static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
+static int32_t hook_Input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
+    int32_t result = orig_Input2 ? orig_Input2(thiz, a1, a2, a3, a4, event) : 0;
+    if (result == 0 && event && *event && g_Initialized) {
+        ImGui_ImplAndroid_HandleInputEvent(*event);
+    }
+    return result;
+}
 
 // ==============================
 // OpenGL state
@@ -209,31 +226,31 @@ static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     return orig_eglSwapBuffers(dpy, surf);
 }
 
-// ==============================
-// Simple hooking (without preloader)
-// ==============================
-static void SimpleHook() {
-    void* egl_handle = dlopen("libEGL.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (egl_handle) {
-        orig_eglSwapBuffers = reinterpret_cast<EGLBoolean (*)(EGLDisplay, EGLSurface)>(
-            dlsym(egl_handle, "eglSwapBuffers"));
-        LOGI("Found eglSwapBuffers: %p", (void*)orig_eglSwapBuffers);
+static void HookInput() {
+    void* sym1 = (void*)GlossSymbol(GlossOpen("libinput.so"),
+        "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
+    if (sym1) {
+        GHook h = GlossHook(sym1, (void*)hook_Input1, (void**)&orig_Input1);
+        if (h) return;
     }
-    
-    // Try to hook AAssetManager_open too (for actual INEB functionality)
-    void* android_handle = dlopen("libandroid.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (android_handle) {
-        orig_AAssetManager_open = reinterpret_cast<void* (*)(void*, const char*, int)>(
-            dlsym(android_handle, "AAssetManager_open"));
-        LOGI("Found AAssetManager_open: %p", (void*)orig_AAssetManager_open);
+    void* sym2 = (void*)GlossSymbol(GlossOpen("libinput.so"),
+        "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
+    if (sym2) {
+        GHook h = GlossHook(sym2, (void*)hook_Input2, (void**)&orig_Input2);
+        if (h) return;
     }
-    
-    LOGI("Hooking setup complete!");
 }
 
 static void* MainThread(void*) {
     sleep(3);
-    SimpleHook();
+    GlossInit(true);
+    GHandle hEGL = GlossOpen("libEGL.so");
+    if (!hEGL) return nullptr;
+    void* swap = (void*)GlossSymbol(hEGL, "eglSwapBuffers", nullptr);
+    if (!swap) return nullptr;
+    GHook h = GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
+    if (!h) return nullptr;
+    HookInput();
     LOGI("INEBWithToggle mod loaded successfully!");
     return nullptr;
 }
